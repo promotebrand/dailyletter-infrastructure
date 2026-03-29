@@ -3507,3 +3507,398 @@ document OSAP and DailyCut admin routes
 add internal service auth
 standardize service-to-service URLs
 remove copied monolith remnants when safe
+
+
+DailyCut Operator Note
+What this system is
+
+DailyCut is now a standalone production application running on its own EC2 instance, with its own domain, its own PM2 process, its own local environment file, and its own reverse-proxy routing.
+
+It is no longer dependent on the old Daily Letter backend path for live runtime configuration.
+
+This means DailyCut can now be maintained, restarted, debugged, and evolved independently.
+
+What was achieved
+
+We completed the DailyCut standalone cutover and hardening.
+
+That included:
+
+confirming DailyCut code runs from its own server path
+confirming PM2 runs the correct DailyCut app
+identifying and removing the remaining runtime dependency on the old Daily Letter env path
+creating a local DailyCut env file on the DailyCut server
+repointing PM2 to use that local env file
+setting NODE_ENV=production
+replacing placeholder JWT secret with a real secret
+rotating and installing the OpenAI API key
+verifying local health on port 5003
+verifying public health on https://dailycut.ai
+clearing old PM2 log noise so future debugging starts clean
+
+DailyCut is now operationally standalone.
+
+DailyCut SSH access
+
+Use this from your Mac terminal, not from inside another EC2 box:
+
+ssh -i ~/.ssh/my-connect-key.pem ec2-user@44.200.42.187
+
+Why:
+This takes you directly into the DailyCut EC2 server.
+
+Important:
+Do not try to use ~/.ssh/my-connect-key.pem from inside another EC2 server unless that key is actually present there. Earlier, that caused confusion because the key path existed on the Mac, not on the server.
+
+Server identity
+Server role: DailyCut standalone production server
+Public domain: https://dailycut.ai
+WWW domain: https://www.dailycut.ai
+Local app port: 5003
+PM2 process name: dailycut-app
+Main filesystem paths
+App root
+/home/ec2-user/dailycut-standalone
+Main server file
+/home/ec2-user/dailycut-standalone/apps/dailycut/server.js
+DailyCut env file
+/home/ec2-user/dailycut-standalone/.env.dailycut
+PM2 dump file
+/home/ec2-user/.pm2/dump.pm2
+PM2 logs
+/home/ec2-user/.pm2/logs/dailycut-app-out.log
+/home/ec2-user/.pm2/logs/dailycut-app-error.log
+Nginx config
+/etc/nginx/conf.d/dailycut.ai.conf
+Current runtime model
+
+The application starts from:
+
+/home/ec2-user/dailycut-standalone/apps/dailycut/server.js
+
+The app loads environment variables through:
+
+require("dotenv").config({ path: process.env.ENV_FILE || ".env" });
+
+That means PM2 must supply:
+
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut
+
+This was one of the most important parts of the cutover.
+
+Before the fix, PM2 was still pointing to the old backend env path under Daily Letter.
+After the fix, PM2 now uses the local DailyCut env file.
+
+That is one of the key reasons the system is now truly standalone.
+
+Current env file
+
+Current env file location:
+
+/home/ec2-user/dailycut-standalone/.env.dailycut
+
+This file now contains the live runtime variables for DailyCut.
+
+At minimum, it has included:
+
+PORT=5003
+JWT_SECRET=...
+DAILYCUT_ADMIN_COOKIE_NAME=dailycut_admin
+DAILYCUT_PUBLIC_BASE_URL=https://dailycut.ai
+POSTS_TABLE=dailycut-posts
+DAILYCUT_ARCHIVE_TABLE=dailycut-archive
+OPENAI_API_KEY=...
+DEFAULT_TTS_VOICE=alloy
+NODE_ENV=production
+
+Do not paste secrets into chat.
+
+If rotating credentials again, update this file directly on the server.
+
+PM2 operations
+Check PM2 status
+pm2 list
+Show app details
+pm2 show dailycut-app
+Restart DailyCut with correct env file
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+Save PM2 state
+pm2 save
+Restart + save together
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+pm2 save
+
+Why:
+This makes sure PM2 restarts DailyCut with the correct standalone env path and persists that runtime state across reboot.
+
+Health checks
+Local health check
+curl -I http://127.0.0.1:5003
+
+Expected:
+HTTP/1.1 200 OK
+
+Public health check
+curl -I https://dailycut.ai
+
+Expected:
+HTTP/1.1 200 OK
+
+Both together
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+
+Why:
+
+local check proves the Node/Express app is alive
+public check proves Nginx and public routing are correct
+Log checks
+Error log
+pm2 logs dailycut-app --err --lines 50 --nostream
+Out log
+pm2 logs dailycut-app --out --lines 50 --nostream
+Direct file tail
+tail -n 80 /home/ec2-user/.pm2/logs/dailycut-app-error.log
+tail -n 80 /home/ec2-user/.pm2/logs/dailycut-app-out.log
+Flush stale logs
+pm2 flush
+
+Why:
+We flushed old logs at the end of cutover so future debugging reflects the current system, not stale warnings from earlier restart cycles.
+
+Nginx routing
+
+DailyCut public routing is handled by Nginx.
+
+Relevant config file:
+
+/etc/nginx/conf.d/dailycut.ai.conf
+
+This config points public traffic to:
+
+http://127.0.0.1:5003
+Check routing config
+sudo grep -Rni "dailycut.ai\|127.0.0.1:5003\|proxy_pass" /etc/nginx /etc/nginx/conf.d 2>/dev/null | sed -n '1,260p'
+Test Nginx config
+sudo nginx -t
+Reload Nginx
+sudo systemctl reload nginx
+
+Why:
+If local app health is good but public dailycut.ai returns 502, Nginx is one of the first places to inspect.
+
+What was fixed during this cutover
+1. Hidden env dependency was found
+
+PM2 was still launching DailyCut with an old env path from the Daily Letter backend.
+
+That meant DailyCut looked split, but was not truly independent.
+
+We fixed that by:
+
+creating .env.dailycut locally on the DailyCut server
+restarting PM2 with ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut
+saving PM2 state
+2. Placeholder JWT secret was replaced
+
+The original JWT value was placeholder-style and not safe for production.
+
+We replaced it with a real generated secret.
+
+3. Placeholder OpenAI key was replaced
+
+The original OpenAI line was placeholder-style and had to be replaced with a real key on the server.
+
+4. Production mode was set
+
+We added:
+
+NODE_ENV=production
+
+to the local env file so DailyCut runs in production mode.
+
+5. Old warning noise was removed from active debugging
+
+We removed the fake standalone warning from the code path and flushed PM2 logs so the operator sees only current behavior.
+
+Important operational behavior discovered during cutover
+Restart timing can briefly look like failure
+
+Immediately after PM2 restart, there were moments where:
+
+curl -I http://127.0.0.1:5003 failed briefly
+https://dailycut.ai showed 502 Bad Gateway
+
+But after a few seconds, the app came back healthy and returned 200 OK.
+
+So after restart, always wait a few seconds before concluding the app is broken.
+
+Useful pattern:
+
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+pm2 save
+sleep 5
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+Safe edit workflow for this server
+
+When making changes, use this approach:
+
+1. Enter server
+ssh -i ~/.ssh/my-connect-key.pem ec2-user@44.200.42.187
+cd /home/ec2-user/dailycut-standalone
+2. Make a backup first
+STAMP=$(date +%Y%m%d-%H%M%S)
+mkdir -p ~/backups/dailycut-$STAMP
+cp apps/dailycut/server.js ~/backups/dailycut-$STAMP/server.js.bak 2>/dev/null || true
+cp .env.dailycut ~/backups/dailycut-$STAMP/.env.dailycut.bak 2>/dev/null || true
+pm2 list > ~/backups/dailycut-$STAMP/pm2.txt
+3. Inspect before editing
+
+Examples:
+
+nl -ba apps/dailycut/server.js | sed -n '1,220p'
+grep -Rni "ENV_FILE\|dotenv\|OPENAI_API_KEY\|JWT_SECRET" .
+4. Edit surgically
+
+For env:
+
+nano .env.dailycut
+
+For code:
+Use python3, sed, or a precise edit method after first viewing exact line locations.
+
+5. Restart and verify
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+pm2 save
+sleep 5
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+6. Check logs if needed
+tail -n 80 /home/ec2-user/.pm2/logs/dailycut-app-error.log
+tail -n 80 /home/ec2-user/.pm2/logs/dailycut-app-out.log
+
+This workflow keeps changes controlled and reversible.
+
+Backup pattern used during this work
+
+We repeatedly used timestamped backup folders under:
+
+/home/ec2-user/backups/
+
+Example structure:
+
+/home/ec2-user/backups/dailycut-YYYYMMDD-HHMMSS/
+
+Typical contents:
+
+server.js.bak
+.env.dailycut.bak
+pm2.txt
+dump.pm2.bak
+
+When doing future risky changes, keep following this model.
+
+If DailyCut goes down
+
+Use this sequence.
+
+1. Check PM2
+pm2 list
+2. Check local port
+curl -I http://127.0.0.1:5003
+3. Check public domain
+curl -I https://dailycut.ai
+4. Read logs
+tail -n 100 /home/ec2-user/.pm2/logs/dailycut-app-error.log
+tail -n 100 /home/ec2-user/.pm2/logs/dailycut-app-out.log
+5. Confirm Nginx config
+sudo nginx -t
+sudo systemctl reload nginx
+6. Confirm the env file still exists
+ls -la /home/ec2-user/dailycut-standalone/.env.dailycut
+7. Restart with explicit env file
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+pm2 save
+sleep 5
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+Security notes
+1. Never paste live secrets into chat
+
+During this cutover, OpenAI keys were exposed in chat and had to be rotated.
+
+Going forward:
+
+update keys only inside nano on the server
+do not paste full secret values into chat
+if a secret is exposed, rotate it immediately
+2. Use separate OpenAI keys per app
+
+Recommended model:
+
+one key for DailyCut
+one key for OSAP
+one key for Daily Letter
+
+Even better:
+
+separate OpenAI project per product
+
+Why:
+That prevents one compromise from affecting every product and makes cost/accounting cleaner.
+
+3. JWT secret is now app-local
+
+That is good. Keep it that way.
+
+Non-urgent remaining work
+
+DailyCut is live and standalone, but a few later improvements remain.
+
+AWS SDK v2 warning
+
+Current logs still show:
+
+AWS SDK for JavaScript v2 has reached end-of-support
+
+This is not currently breaking DailyCut, but later the backend should be migrated to AWS SDK v3.
+
+This is a cleanup/hardening task, not an emergency.
+
+Optional future hardening
+formal PM2 ecosystem file for DailyCut
+explicit deployment script
+tighter secret rotation routine
+admin credential audit
+structured monitoring/alerts
+Current canonical restart command
+
+Use this exact command whenever restarting DailyCut in a controlled way:
+
+ENV_FILE=/home/ec2-user/dailycut-standalone/.env.dailycut pm2 restart dailycut-app --update-env
+pm2 save
+sleep 5
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+Current canonical login + health workflow
+ssh -i ~/.ssh/my-connect-key.pem ec2-user@44.200.42.187
+cd /home/ec2-user/dailycut-standalone
+pm2 list
+curl -I http://127.0.0.1:5003
+curl -I https://dailycut.ai
+Final status
+
+DailyCut standalone status: achieved.
+
+It is now:
+
+independently hosted
+independently configured
+independently restartable
+independently routable
+independently debuggable
+
+It remains connected to the broader ecosystem by purpose, but not dependent on Daily Letter’s runtime skeleton to stay alive.
+
+That is the core milestone this cutover accomplished.
